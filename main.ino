@@ -27,6 +27,7 @@ void loop() {
 }
 
 void handleCommand(const String& command) {
+  // 兼容原版事件，保持默认示例行为不变。
   if (command == "PERMISSION_WAIT") {
     currentState = "WAITING_PERMISSION";
   } else if (command == "TASK_DONE") {
@@ -34,6 +35,7 @@ void handleCommand(const String& command) {
   } else if (command == "ROUND_STOP") {
     currentState = "ROUND_STOP";
   }
+  // 新增的更解耦 signal 如果当前固件未处理，会被自然忽略。
 }
 
 void updateLed() {

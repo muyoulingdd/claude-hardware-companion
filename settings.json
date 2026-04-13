@@ -20,6 +20,35 @@
             "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"C:/ClaudeHardware/send_event.ps1\""
           }
         ]
+      },
+      {
+        "matcher": "elicitation_dialog",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"C:/ClaudeHardware/send_event.ps1\""
+          }
+        ]
+      },
+      {
+        "matcher": "idle_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"C:/ClaudeHardware/send_event.ps1\""
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"C:/ClaudeHardware/send_event.ps1\""
+          }
+        ]
       }
     ],
     "TaskCompleted": [
