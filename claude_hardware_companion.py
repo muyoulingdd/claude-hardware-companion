@@ -1,7 +1,9 @@
 import logging
+import json
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import serial
@@ -15,10 +17,12 @@ BAUDRATE = 115200
 PRODUCT_STRING = "ClaudeHookDevice"
 USB_VID = None
 USB_PID = None
+SERIAL_PROTOCOL = "legacy"
 RECONNECT_INTERVAL = 2.0
 DEDUP_WINDOW_SECONDS = 1.2
 TASK_DONE_SUPPRESS_STOP_SECONDS = 3.0
 SERIAL_WRITE_TIMEOUT = 1.0
+LOG_PATH = Path(r"C:\ClaudeHardware\companion.log")
 
 
 logging.basicConfig(
@@ -26,6 +30,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("claude-hardware-companion")
+file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(file_handler)
+logger.propagate = False
 
 app = Flask(__name__)
 
@@ -38,6 +46,18 @@ class SerialTarget:
     vid: Optional[int]
     pid: Optional[int]
     product: Optional[str]
+
+
+@dataclass
+class SignalEvent:
+    # 归一化后的统一事件协议。硬件可以只看 signal，也可以兼容 legacy_event。
+    signal: str
+    source: str
+    legacy_event: Optional[str] = None
+    tool_name: Optional[str] = None
+    notification_type: Optional[str] = None
+    title: Optional[str] = None
+    message: Optional[str] = None
 
 
 class HardwareBridge:
@@ -77,6 +97,7 @@ class HardwareBridge:
                 "serial_vid": f"{target.vid:04X}" if target and target.vid is not None else None,
                 "serial_pid": f"{target.pid:04X}" if target and target.pid is not None else None,
                 "last_error": self._last_error,
+                "log_path": str(LOG_PATH),
             }
 
     def process_hook_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -84,48 +105,81 @@ class HardwareBridge:
         # 1. 归一化事件
         # 2. 按状态机判断是否应发出
         # 3. 若允许则写入串口
-        normalized, detail = self._normalize_event(payload)
-        if not normalized:
+        signal_event = self._normalize_event(payload)
+        if not signal_event:
+            logger.info(
+                "Ignored unsupported event source=%s notification_type=%s tool_name=%s",
+                str(payload.get("hook_event_name") or payload.get("event") or payload.get("type") or ""),
+                str(payload.get("notification_type") or payload.get("subtype") or ""),
+                str(payload.get("tool_name") or ""),
+            )
             return {
                 "accepted": False,
                 "reason": "unsupported_event",
-                "detail": detail,
+                "detail": {
+                    "source": str(payload.get("hook_event_name") or payload.get("event") or payload.get("type") or ""),
+                    "notification_type": str(payload.get("notification_type") or payload.get("subtype") or ""),
+                    "tool_name": str(payload.get("tool_name") or ""),
+                },
             }
 
         with self._lock:
-            should_send, reason = self._should_emit_locked(normalized)
+            should_send, reason = self._should_emit_locked(signal_event)
             if not should_send:
+                logger.info(
+                    "Filtered signal=%s legacy_event=%s reason=%s state=%s",
+                    signal_event.signal,
+                    signal_event.legacy_event,
+                    reason,
+                    self._current_state,
+                )
                 return {
                     "accepted": True,
-                    "normalized_event": normalized,
+                    "signal": signal_event.signal,
+                    "legacy_event": signal_event.legacy_event,
                     "emitted": False,
                     "reason": reason,
                     "state": self._current_state,
                 }
 
-            sent = self._send_serial_locked(normalized)
+            sent = self._send_serial_locked(signal_event)
             now = time.monotonic()
             # 不论串口当下是否可用，只要该事件通过了状态机，都更新去重时钟。
-            self._last_event_name = normalized
+            self._last_event_name = signal_event.signal
             self._last_event_time = now
-            if normalized == "PERMISSION_WAIT":
+            if signal_event.legacy_event == "PERMISSION_WAIT":
                 self._current_state = "waiting_permission"
-            elif normalized == "TASK_DONE":
+            elif signal_event.signal == "CLAUDE_USER_QUESTION":
+                self._current_state = "waiting_user_question"
+            elif signal_event.signal == "CLAUDE_IDLE_INPUT":
+                self._current_state = "waiting_user_input"
+            elif signal_event.legacy_event == "TASK_DONE":
                 self._current_state = "idle"
                 self._last_task_done_time = now
-            elif normalized == "ROUND_STOP":
+            elif signal_event.legacy_event == "ROUND_STOP":
                 self._current_state = "idle"
 
+            logger.info(
+                "Handled signal=%s legacy_event=%s emitted=%s state=%s source=%s tool_name=%s notification_type=%s",
+                signal_event.signal,
+                signal_event.legacy_event,
+                sent,
+                self._current_state,
+                signal_event.source,
+                signal_event.tool_name,
+                signal_event.notification_type,
+            )
             return {
                 "accepted": True,
-                "normalized_event": normalized,
+                "signal": signal_event.signal,
+                "legacy_event": signal_event.legacy_event,
                 "emitted": sent,
                 "reason": "serial_sent" if sent else "serial_unavailable",
                 "state": self._current_state,
             }
 
-    def _normalize_event(self, payload: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any]]:
-        """把 Claude Code hooks 的不同事件统一映射成 3 种硬件事件。"""
+    def _normalize_event(self, payload: Dict[str, Any]) -> Optional[SignalEvent]:
+        """把 Claude Code hooks 映射成更解耦的统一 signal 协议。"""
         event_name = str(
             payload.get("hook_event_name")
             or payload.get("event")
@@ -133,33 +187,90 @@ class HardwareBridge:
             or ""
         )
         notification_type = str(payload.get("notification_type") or payload.get("subtype") or "")
+        tool_name = str(payload.get("tool_name") or "")
+        title = str(payload.get("title") or "")
+        message = str(payload.get("message") or "")
 
         if event_name == "PermissionRequest":
-            return "PERMISSION_WAIT", {"source": event_name}
+            signal = "CLAUDE_PROCESS_CONFIRM_REQUEST" if tool_name == "Bash" else "CLAUDE_PERMISSION_REQUEST"
+            return SignalEvent(
+                signal=signal,
+                source=event_name,
+                legacy_event="PERMISSION_WAIT",
+                tool_name=tool_name or None,
+                message=message or None,
+                title=title or None,
+            )
         if event_name == "Notification" and notification_type == "permission_prompt":
-            return "PERMISSION_WAIT", {"source": f"{event_name}:{notification_type}"}
+            signal = "CLAUDE_PROCESS_CONFIRM_REQUEST" if "Bash" in message else "CLAUDE_PERMISSION_REQUEST"
+            return SignalEvent(
+                signal=signal,
+                source=f"{event_name}:{notification_type}",
+                legacy_event="PERMISSION_WAIT",
+                notification_type=notification_type,
+                message=message or None,
+                title=title or None,
+            )
+        if event_name == "Notification" and notification_type == "elicitation_dialog":
+            return SignalEvent(
+                signal="CLAUDE_USER_QUESTION",
+                source=f"{event_name}:{notification_type}",
+                notification_type=notification_type,
+                message=message or None,
+                title=title or None,
+            )
+        if event_name == "Notification" and notification_type == "idle_prompt":
+            return SignalEvent(
+                signal="CLAUDE_IDLE_INPUT",
+                source=f"{event_name}:{notification_type}",
+                notification_type=notification_type,
+                message=message or None,
+                title=title or None,
+            )
+        if event_name == "PreToolUse" and tool_name == "AskUserQuestion":
+            return SignalEvent(
+                signal="CLAUDE_USER_QUESTION",
+                source=f"{event_name}:{tool_name}",
+                tool_name=tool_name,
+                message=message or None,
+                title=title or None,
+            )
         if event_name == "TaskCompleted":
-            return "TASK_DONE", {"source": event_name}
+            return SignalEvent(
+                signal="CLAUDE_TASK_DONE",
+                source=event_name,
+                legacy_event="TASK_DONE",
+            )
         if event_name == "Stop":
-            return "ROUND_STOP", {"source": event_name}
-        return None, {"source": event_name, "notification_type": notification_type}
+            return SignalEvent(
+                signal="CLAUDE_ROUND_STOP",
+                source=event_name,
+                legacy_event="ROUND_STOP",
+            )
+        return None
 
-    def _should_emit_locked(self, normalized_event: str) -> Tuple[bool, str]:
+    def _should_emit_locked(self, signal_event: SignalEvent) -> Tuple[bool, str]:
         """按去重、节流和状态机规则决定当前事件是否应真正输出。"""
         now = time.monotonic()
 
         if (
-            self._last_event_name == normalized_event
+            self._last_event_name == signal_event.signal
             and now - self._last_event_time < DEDUP_WINDOW_SECONDS
         ):
             # 1.2 秒内同类事件直接去重。
             return False, "dedup_window"
 
-        if normalized_event == "PERMISSION_WAIT" and self._current_state == "waiting_permission":
+        if signal_event.legacy_event == "PERMISSION_WAIT" and self._current_state == "waiting_permission":
             # 已经处于等待授权状态时，不重复提醒硬件。
             return False, "already_waiting_permission"
 
-        if normalized_event == "ROUND_STOP":
+        if signal_event.signal == "CLAUDE_USER_QUESTION" and self._current_state == "waiting_user_question":
+            return False, "already_waiting_user_question"
+
+        if signal_event.signal == "CLAUDE_IDLE_INPUT" and self._current_state == "waiting_user_input":
+            return False, "already_waiting_user_input"
+
+        if signal_event.legacy_event == "ROUND_STOP":
             if self._current_state == "idle":
                 # 空闲态收到 Stop 没有意义，直接丢弃。
                 return False, "stop_ignored_while_idle"
@@ -169,19 +280,36 @@ class HardwareBridge:
 
         return True, "emit"
 
-    def _send_serial_locked(self, normalized_event: str) -> bool:
+    def _serialize_signal(self, signal_event: SignalEvent) -> str:
+        # 默认仍输出旧固件可识别的单行协议；切到 json 可获得完全解耦的协议层。
+        if SERIAL_PROTOCOL == "json":
+            return json.dumps(
+                {
+                    "signal": signal_event.signal,
+                    "legacy_event": signal_event.legacy_event,
+                    "source": signal_event.source,
+                    "tool_name": signal_event.tool_name,
+                    "notification_type": signal_event.notification_type,
+                    "title": signal_event.title,
+                    "message": signal_event.message,
+                },
+                ensure_ascii=True,
+            ) + "\n"
+        return (signal_event.legacy_event or signal_event.signal) + "\n"
+
+    def _send_serial_locked(self, signal_event: SignalEvent) -> bool:
         """如果串口已连接，则发送一行 ASCII 命令给设备。"""
         serial_conn = self._serial
         if not serial_conn or not serial_conn.is_open:
             self._last_error = "serial_unavailable"
-            logger.warning("Serial unavailable, skipped event %s", normalized_event)
+            logger.warning("Serial unavailable, skipped event %s", signal_event.signal)
             return False
 
         try:
-            serial_conn.write((normalized_event + "\n").encode("ascii"))
+            serial_conn.write(self._serialize_signal(signal_event).encode("ascii"))
             serial_conn.flush()
             self._last_error = None
-            logger.info("Sent event to hardware: %s", normalized_event)
+            logger.info("Sent event to hardware: %s", signal_event.signal)
             return True
         except serial.SerialException as exc:
             self._last_error = str(exc)

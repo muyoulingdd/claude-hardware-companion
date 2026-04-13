@@ -1,6 +1,8 @@
 import logging
+import json
 import time
 from pathlib import Path
+from dataclasses import dataclass
 from threading import Lock
 from typing import Any, Dict, Optional, Tuple
 
@@ -24,8 +26,20 @@ logger = logging.getLogger("claude-hardware-companion-test")
 app = Flask(__name__)
 
 
+@dataclass
+class SignalEvent:
+    # 测试版与正式版共用同一层逻辑：只记录“信号”，不绑定硬件效果。
+    signal: str
+    source: str
+    legacy_event: Optional[str] = None
+    tool_name: Optional[str] = None
+    notification_type: Optional[str] = None
+    title: Optional[str] = None
+    message: Optional[str] = None
+
+
 class LocalTestBridge:
-    """测试版常驻服务：不依赖 USB，收到事件后直接触发本机动作。"""
+    """测试版常驻服务：不依赖 USB，收到事件后只记录统一 signal。"""
 
     def __init__(self) -> None:
         # 与正式版保持同样的状态机和去重规则，便于先验证整条链路。
@@ -49,47 +63,57 @@ class LocalTestBridge:
             }
 
     def process_hook_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        normalized, detail = self._normalize_event(payload)
-        if not normalized:
+        signal_event = self._normalize_event(payload)
+        if not signal_event:
             return {
                 "accepted": False,
                 "reason": "unsupported_event",
-                "detail": detail,
+                "detail": {
+                    "source": str(payload.get("hook_event_name") or payload.get("event") or payload.get("type") or ""),
+                    "notification_type": str(payload.get("notification_type") or payload.get("subtype") or ""),
+                    "tool_name": str(payload.get("tool_name") or ""),
+                },
             }
 
         with self._lock:
-            should_emit, reason = self._should_emit_locked(normalized)
+            should_emit, reason = self._should_emit_locked(signal_event)
             if not should_emit:
                 return {
                     "accepted": True,
-                    "normalized_event": normalized,
+                    "signal": signal_event.signal,
+                    "legacy_event": signal_event.legacy_event,
                     "emitted": False,
                     "reason": reason,
                     "state": self._current_state,
                 }
 
-            emitted = self._trigger_local_action_locked(normalized)
+            emitted = self._trigger_local_action_locked(signal_event)
             now = time.monotonic()
-            self._last_event_name = normalized
+            self._last_event_name = signal_event.signal
             self._last_event_time = now
-            if normalized == "PERMISSION_WAIT":
+            if signal_event.legacy_event == "PERMISSION_WAIT":
                 self._current_state = "waiting_permission"
-            elif normalized == "TASK_DONE":
+            elif signal_event.signal == "CLAUDE_USER_QUESTION":
+                self._current_state = "waiting_user_question"
+            elif signal_event.signal == "CLAUDE_IDLE_INPUT":
+                self._current_state = "waiting_user_input"
+            elif signal_event.legacy_event == "TASK_DONE":
                 self._current_state = "idle"
                 self._last_task_done_time = now
-            elif normalized == "ROUND_STOP":
+            elif signal_event.legacy_event == "ROUND_STOP":
                 self._current_state = "idle"
 
             return {
                 "accepted": True,
-                "normalized_event": normalized,
+                "signal": signal_event.signal,
+                "legacy_event": signal_event.legacy_event,
                 "emitted": emitted,
                 "reason": "local_action_triggered" if emitted else "local_action_failed",
                 "state": self._current_state,
             }
 
-    def _normalize_event(self, payload: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any]]:
-        """把 Claude Code hooks 事件统一映射成测试版内部使用的 3 种状态。"""
+    def _normalize_event(self, payload: Dict[str, Any]) -> Optional[SignalEvent]:
+        """把 Claude Code hooks 事件映射成统一 signal，便于测试协议层。"""
         event_name = str(
             payload.get("hook_event_name")
             or payload.get("event")
@@ -97,31 +121,88 @@ class LocalTestBridge:
             or ""
         )
         notification_type = str(payload.get("notification_type") or payload.get("subtype") or "")
+        tool_name = str(payload.get("tool_name") or "")
+        title = str(payload.get("title") or "")
+        message = str(payload.get("message") or "")
 
         if event_name == "PermissionRequest":
-            return "PERMISSION_WAIT", {"source": event_name}
+            signal = "CLAUDE_PROCESS_CONFIRM_REQUEST" if tool_name == "Bash" else "CLAUDE_PERMISSION_REQUEST"
+            return SignalEvent(
+                signal=signal,
+                source=event_name,
+                legacy_event="PERMISSION_WAIT",
+                tool_name=tool_name or None,
+                title=title or None,
+                message=message or None,
+            )
         if event_name == "Notification" and notification_type == "permission_prompt":
-            return "PERMISSION_WAIT", {"source": f"{event_name}:{notification_type}"}
+            signal = "CLAUDE_PROCESS_CONFIRM_REQUEST" if "Bash" in message else "CLAUDE_PERMISSION_REQUEST"
+            return SignalEvent(
+                signal=signal,
+                source=f"{event_name}:{notification_type}",
+                legacy_event="PERMISSION_WAIT",
+                notification_type=notification_type,
+                title=title or None,
+                message=message or None,
+            )
+        if event_name == "Notification" and notification_type == "elicitation_dialog":
+            return SignalEvent(
+                signal="CLAUDE_USER_QUESTION",
+                source=f"{event_name}:{notification_type}",
+                notification_type=notification_type,
+                title=title or None,
+                message=message or None,
+            )
+        if event_name == "Notification" and notification_type == "idle_prompt":
+            return SignalEvent(
+                signal="CLAUDE_IDLE_INPUT",
+                source=f"{event_name}:{notification_type}",
+                notification_type=notification_type,
+                title=title or None,
+                message=message or None,
+            )
+        if event_name == "PreToolUse" and tool_name == "AskUserQuestion":
+            return SignalEvent(
+                signal="CLAUDE_USER_QUESTION",
+                source=f"{event_name}:{tool_name}",
+                tool_name=tool_name,
+                title=title or None,
+                message=message or None,
+            )
         if event_name == "TaskCompleted":
-            return "TASK_DONE", {"source": event_name}
+            return SignalEvent(
+                signal="CLAUDE_TASK_DONE",
+                source=event_name,
+                legacy_event="TASK_DONE",
+            )
         if event_name == "Stop":
-            return "ROUND_STOP", {"source": event_name}
-        return None, {"source": event_name, "notification_type": notification_type}
+            return SignalEvent(
+                signal="CLAUDE_ROUND_STOP",
+                source=event_name,
+                legacy_event="ROUND_STOP",
+            )
+        return None
 
-    def _should_emit_locked(self, normalized_event: str) -> Tuple[bool, str]:
+    def _should_emit_locked(self, signal_event: SignalEvent) -> Tuple[bool, str]:
         """测试版与正式版保持一致的去重和状态机规则。"""
         now = time.monotonic()
 
         if (
-            self._last_event_name == normalized_event
+            self._last_event_name == signal_event.signal
             and now - self._last_event_time < DEDUP_WINDOW_SECONDS
         ):
             return False, "dedup_window"
 
-        if normalized_event == "PERMISSION_WAIT" and self._current_state == "waiting_permission":
+        if signal_event.legacy_event == "PERMISSION_WAIT" and self._current_state == "waiting_permission":
             return False, "already_waiting_permission"
 
-        if normalized_event == "ROUND_STOP":
+        if signal_event.signal == "CLAUDE_USER_QUESTION" and self._current_state == "waiting_user_question":
+            return False, "already_waiting_user_question"
+
+        if signal_event.signal == "CLAUDE_IDLE_INPUT" and self._current_state == "waiting_user_input":
+            return False, "already_waiting_user_input"
+
+        if signal_event.legacy_event == "ROUND_STOP":
             if self._current_state == "idle":
                 return False, "stop_ignored_while_idle"
             if now - self._last_task_done_time < TASK_DONE_SUPPRESS_STOP_SECONDS:
@@ -129,19 +210,26 @@ class LocalTestBridge:
 
         return True, "emit"
 
-    def _trigger_local_action_locked(self, normalized_event: str) -> bool:
+    def _trigger_local_action_locked(self, signal_event: SignalEvent) -> bool:
         """收到事件后仅写入本地日志，便于无需 USB 直接验证。"""
         try:
             TEST_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-            TEST_LAST_EVENT_PATH.write_text(
-                f"{timestamp} {normalized_event}\n",
-                encoding="utf-8",
-            )
+            payload = {
+                "timestamp": timestamp,
+                "signal": signal_event.signal,
+                "legacy_event": signal_event.legacy_event,
+                "source": signal_event.source,
+                "tool_name": signal_event.tool_name,
+                "notification_type": signal_event.notification_type,
+                "title": signal_event.title,
+                "message": signal_event.message,
+            }
+            TEST_LAST_EVENT_PATH.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
             with TEST_LOG_PATH.open("a", encoding="utf-8") as fh:
-                fh.write(f"{timestamp} {normalized_event}\n")
+                fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
-            logger.info("Triggered local test action: %s", normalized_event)
+            logger.info("Triggered local test action: %s", signal_event.signal)
             self._last_error = None
             return True
         except Exception as exc:  # pragma: no cover - defensive logging
