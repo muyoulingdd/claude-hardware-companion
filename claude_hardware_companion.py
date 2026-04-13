@@ -282,6 +282,7 @@ class HardwareBridge:
 
     def _serialize_signal(self, signal_event: SignalEvent) -> str:
         # 默认仍输出旧固件可识别的单行协议；切到 json 可获得完全解耦的协议层。
+        # 推荐先用 legacy 模式验证链路，再根据硬件能力切换到 json。
         if SERIAL_PROTOCOL == "json":
             return json.dumps(
                 {
