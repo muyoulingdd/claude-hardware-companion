@@ -28,6 +28,7 @@ void loop() {
 
 void handleCommand(const String& command) {
   // 兼容原版事件，保持默认示例行为不变。
+  // 如果后续要支持新 signal，可以从这里继续扩展分支判断。
   if (command == "PERMISSION_WAIT") {
     currentState = "WAITING_PERMISSION";
   } else if (command == "TASK_DONE") {

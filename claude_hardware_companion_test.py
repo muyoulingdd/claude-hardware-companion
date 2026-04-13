@@ -215,6 +215,7 @@ class LocalTestBridge:
         try:
             TEST_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            # 每条日志保留完整 signal 上下文，方便后续对照 Claude hooks 原始事件排查。
             payload = {
                 "timestamp": timestamp,
                 "signal": signal_event.signal,
